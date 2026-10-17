@@ -1,0 +1,212 @@
+<!DOCTYPE html>
+<html lang="vi">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Người que AR</title>
+<style>
+  html, body { margin: 0; height: 100%; background: #000; overflow: hidden; font-family: system-ui, sans-serif; }
+  video { display: none; }
+  canvas { position: fixed; inset: 0; width: 100%; height: 100%; }
+  #ui { position: fixed; top: calc(10px + env(safe-area-inset-top)); left: 10px; right: 10px; display: flex; flex-wrap: wrap; gap: 8px; align-items: center; z-index: 5; }
+  button { padding: 9px 14px; border: 0; border-radius: 8px; background: #ffffffdd; font-size: 14px; }
+  #status { color: #fff; font-size: 13px; text-shadow: 0 0 4px #000; }
+</style>
+</head>
+<body>
+<video id="video" playsinline muted></video>
+<canvas id="canvas"></canvas>
+<div id="ui">
+  <button id="switchCam">Đổi camera</button>
+  <button id="toggleBg">Ẩn camera</button>
+  <span id="status">Đang tải mô hình...</span>
+</div>
+
+<script type="module">
+import { PoseLandmarker, FilesetResolver } from "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/vision_bundle.mjs";
+
+const video = document.getElementById("video");
+const canvas = document.getElementById("canvas");
+const ctx = canvas.getContext("2d");
+const statusEl = document.getElementById("status");
+
+const MAX_PEOPLE = 10;      // tăng nếu máy khỏe, giảm nếu lag
+const SMOOTH = 0.7;         // 1 = bám sát tức thì, thấp hơn = mượt nhưng trễ
+const color = (i) => `hsl(${(i * 137.5) % 360} 100% 60%)`;
+
+// Ưu tiên file model đặt cạnh index.html (tải nhanh), không có thì tải từ Google
+const MODEL_LOCAL = "pose_landmarker_lite.task";
+const MODEL_REMOTE = "https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/1/pose_landmarker_lite.task";
+
+let showCam = true;
+let facing = "user";        // "user" = cam trước, "environment" = cam sau
+let landmarker = null;
+let stream = null;
+let smooth = [];
+
+const mirror = () => facing === "user";
+
+document.getElementById("toggleBg").onclick = (e) => {
+  showCam = !showCam;
+  e.target.textContent = showCam ? "Ẩn camera" : "Hiện camera";
+};
+document.getElementById("switchCam").onclick = async () => {
+  facing = facing === "user" ? "environment" : "user";
+  smooth = [];
+  await startCamera();
+};
+
+function resize() {
+  const dpr = Math.min(window.devicePixelRatio || 1, 2);
+  canvas.width = window.innerWidth * dpr;
+  canvas.height = window.innerHeight * dpr;
+}
+window.addEventListener("resize", resize);
+resize();
+
+async function pickModel() {
+  try {
+    const r = await fetch(MODEL_LOCAL, { method: "HEAD" });
+    if (r.ok) return MODEL_LOCAL;
+  } catch (e) {}
+  return MODEL_REMOTE;
+}
+
+async function createLandmarker() {
+  const fileset = await FilesetResolver.forVisionTasks(
+    "https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@0.10.14/wasm"
+  );
+  const modelAssetPath = await pickModel();
+  const make = (delegate) => PoseLandmarker.createFromOptions(fileset, {
+    baseOptions: { modelAssetPath, delegate },
+    runningMode: "VIDEO",
+    numPoses: MAX_PEOPLE,
+    minPoseDetectionConfidence: 0.3,   // thấp hơn = nhạy hơn
+    minPosePresenceConfidence: 0.3,
+    minTrackingConfidence: 0.3
+  });
+  try { return await make("GPU"); }
+  catch (e) { console.warn("GPU lỗi, chuyển sang CPU", e); return await make("CPU"); }
+}
+
+async function startCamera() {
+  if (stream) stream.getTracks().forEach((t) => t.stop());
+  statusEl.textContent = "Đang mở camera...";
+  try {
+    stream = await navigator.mediaDevices.getUserMedia({
+      video: { facingMode: { ideal: facing }, width: { ideal: 640 }, height: { ideal: 480 }, frameRate: { ideal: 30 } },
+      audio: false
+    });
+  } catch (err) {
+    statusEl.textContent = "Không mở được camera này: " + err.message;
+    return;
+  }
+  video.srcObject = stream;
+  await video.play();
+  statusEl.textContent = "Đứng vào khung hình nhé!";
+}
+
+function coverRect() {
+  const vw = video.videoWidth, vh = video.videoHeight;
+  const s = Math.max(canvas.width / vw, canvas.height / vh);
+  const w = vw * s, h = vh * s;
+  return { x: (canvas.width - w) / 2, y: (canvas.height - h) / 2, w, h };
+}
+
+function toScreen(lm, r) {
+  const x = mirror() ? 1 - lm.x : lm.x;
+  return { x: r.x + x * r.w, y: r.y + lm.y * r.h };
+}
+
+function drawStick(P, col, fancy) {
+  const mid = (a, b) => ({ x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 });
+  const dist = (a, b) => Math.hypot(a.x - b.x, a.y - b.y);
+  const neck = mid(P[11], P[12]);
+  const hip = mid(P[23], P[24]);
+  const shoulderW = dist(P[11], P[12]);
+  const headR = Math.max(14, shoulderW * 0.45);
+  const head = { x: P[0].x, y: P[0].y - headR * 0.15 };
+
+  ctx.strokeStyle = col;
+  ctx.lineCap = "round";
+  ctx.lineJoin = "round";
+  ctx.lineWidth = Math.max(4, shoulderW * 0.12);
+  ctx.shadowColor = col;
+  ctx.shadowBlur = fancy ? 10 : 0;
+
+  const line = (...pts) => {
+    ctx.beginPath();
+    ctx.moveTo(pts[0].x, pts[0].y);
+    for (let i = 1; i < pts.length; i++) ctx.lineTo(pts[i].x, pts[i].y);
+    ctx.stroke();
+  };
+  ctx.beginPath();
+  ctx.arc(head.x, head.y, headR, 0, Math.PI * 2);
+  ctx.stroke();
+  line({ x: head.x, y: head.y + headR }, neck);
+  line(neck, hip);
+  line(P[11], P[12]);
+  line(P[23], P[24]);
+  line(P[11], P[13], P[15]);
+  line(P[12], P[14], P[16]);
+  line(P[23], P[25], P[27]);
+  line(P[24], P[26], P[28]);
+  ctx.shadowBlur = 0;
+}
+
+function render(people) {
+  const r = coverRect();
+  ctx.clearRect(0, 0, canvas.width, canvas.height);
+  if (showCam) {
+    if (mirror()) {
+      ctx.save();
+      ctx.translate(canvas.width, 0);
+      ctx.scale(-1, 1);
+      ctx.drawImage(video, canvas.width - (r.x + r.w), r.y, r.w, r.h);
+      ctx.restore();
+    } else {
+      ctx.drawImage(video, r.x, r.y, r.w, r.h);
+    }
+  } else {
+    ctx.fillStyle = "#0a0a14";
+    ctx.fillRect(0, 0, canvas.width, canvas.height);
+  }
+  const fancy = people.length <= 4;
+  people.forEach((P, i) => drawStick(P, color(i), fancy));
+}
+
+let lastVideoTime = -1;
+let people = [];
+function loop() {
+  requestAnimationFrame(loop);
+  if (!landmarker || video.readyState < 2 || !video.videoWidth) return;
+
+  // Chỉ nhận diện khi có khung hình mới của camera -> đỡ lag
+  if (video.currentTime !== lastVideoTime) {
+    lastVideoTime = video.currentTime;
+    const res = landmarker.detectForVideo(video, performance.now());
+    const r = coverRect();
+    const found = (res.landmarks || []).map((lms) => lms.map((lm) => toScreen(lm, r)));
+    people = found.map((pts, i) => pts.map((p, k) => {
+      const prev = smooth[i] && smooth[i][k];
+      return prev ? { x: prev.x + (p.x - prev.x) * SMOOTH, y: prev.y + (p.y - prev.y) * SMOOTH } : p;
+    }));
+    smooth = people;
+    statusEl.textContent = `Đang thấy ${people.length} người`;
+  }
+  render(people);
+}
+
+(async () => {
+  try {
+    landmarker = await createLandmarker();
+    await startCamera();
+    requestAnimationFrame(loop);
+  } catch (err) {
+    statusEl.textContent = "Lỗi: " + err.message + " (cần https hoặc localhost và cho phép camera)";
+    console.error(err);
+  }
+})();
+</script>
+</body>
+</html>
